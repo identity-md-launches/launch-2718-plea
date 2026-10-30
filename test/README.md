@@ -2,24 +2,27 @@
 
 The original implementation and tests are unchanged. These additions test the court, signed plea intake, and real local Uniswap v4 swaps. They need only the already vendored dependencies; they use no RPC, environment-changing cheatcodes, ffi, network downloads, or files under `test/scratch/`.
 
-## Revision round
+## Revision rounds
 
-The implementation was revised to address the two findings this suite reported last round. Both are now fixed, and their proofs are kept as passing regression tests in `PleaCourtRevision.t.sol`:
+**Round 3.** The implementation fixed the two findings raised against revision 2. Both are now regression tests in `PleaCourtRevision.t.sol`, and no new defect is reported this round:
+
+- **Dead-man sweep at season end (fixed, low, reported by this suite):** `endSeason` now latches a switch that is due before it decides between rolling the pot over and sweeping it. Tests cover the switch falling due at the exact second the season ends (swept), one second later (rolled over once, swept at the next end), and a paying board (prizes first, the rest swept). The court invariant handler now predicts a sweep from `tradesFreely()` rather than `deadManTriggered()`, which matches the fixed rule.
+- **Judge-seller plea hung at 29 votes (fixed):** the hung-Cabal rule now counts eligible judges (`eligibleJudges`). A 1,000-run fuzz over every 13/16 to 16/13 split, in random vote order, checks that the plea stays pending through 28 votes and is denied at the 29th. A second test shows that when the owner rotates the judge-seller off the panel, eligibility goes back to 30 and the plea waits for the replacement's vote.
+
+The owner can still change who is eligible with `setJudges` mid-round. For example, a panel of the 29 judges who already voted plus the seller leaves nobody able to cast a vote. That is the owner power already disclosed in `SECURITY.md`, so it is not raised as a finding.
+
+**Round 2.** The implementation fixed the two findings this suite reported in round 1. Their proofs are kept as passing regression tests in `PleaCourtRevision.t.sol`:
 
 - **Leaderboard promotion (fixed):** the board now keeps a 25-entry bench. Striking the leader of 26 scored sellers lists the 26th, and that seller receives a prize.
 - **Partial-fill accounting (fixed):** the court now reserves a sale (`authorizeSale`) and settles it to the PLEA the pool consumed (`settleSale`). The unconsumed rest returns to the window.
 
-The court test driver now reserves and settles in one call, as the hook does. Three existing tests followed deliberate rule changes rather than defects: amounts above uint128 now revert with `AmountTooLarge`; a 15/15 vote is a hung denial that can be appealed; and prizes are locked credits paid by `claimPrize`. The invariant handler now models partial fills, re-hearings, cooldowns, struck pleas, the ruling period, prize locks, forfeiture of an ended season's prize, and the owner sweep after the switch.
-
-One new defect is reported in `.imd-findings.json` with a runnable proof:
-
-- **Low: dead-man sweep can be missed.** `endSeason` reads `deadManTriggered` without latching a switch that is already due. If the season ends after 33 hours of silence but before anyone latches the switch, the pot rolls over for a season instead of going to the owner. No funds are lost. No passing test asserts this behaviour.
+The court test driver reserves and settles in one call, as the hook does. Three existing tests changed because the rules changed on purpose, not because of defects: amounts above uint128 now revert with `AmountTooLarge`, a 15/15 vote is a hung denial that can be appealed, and prizes are locked credits paid by `claimPrize`. The invariant handler models partial fills, re-hearings, cooldowns, struck pleas, the ruling period, prize locks, forfeiture of an ended season's prize, and the owner sweep after the switch.
 
 ## Test inventory
 
 | File | Coverage |
 | --- | --- |
-| `PleaCourtRevision.t.sol` | Regressions for both earlier findings (bench promotion, partial-fill settlement with a 1,000-run fuzz), settle rejections and rollback, re-hearing laundering through withdraw/resubmit and the Letterbox, 4 h and 24 h cooldown boundaries, withdrawal after votes, struck-seller ban boundaries, last-second ruling before prize unlock with forfeiture, claims for unended seasons |
+| `PleaCourtRevision.t.sol` | Regressions for all four earlier findings (bench promotion, endSeason dead-man latch at its exact boundary, judge-seller settlement at 29 eligible votes with a 1,000-run split/order fuzz, partial-fill settlement with a 1,000-run fuzz), settle rejections and rollback, re-hearing laundering through withdraw/resubmit and the Letterbox, 4 h and 24 h cooldown boundaries, withdrawal after votes, struck-seller ban boundaries, last-second ruling before prize unlock with forfeiture, claims for unended seasons |
 | `PleaCourtAdversarial.t.sol` | Input/type boundaries, ownership changes, invalid votes without state effects, odd/even and seat score rounding, quorum split and dead-man timing, appeal/window boundaries, objection failures and deadlines, prize rounding with bonds and prior claims reserved |
 | `LetterboxAdversarial.t.sol` | Mutations of every signed field, deadline equality, chain/address domain separation, malformed and high-s signatures, nonce rollback on court failure, retry and replay protection |
 | `PleaHookAdversarial.t.sol` | Both PLEA currency orderings; exact input/output sell-gate spoofing, allowance/slippage rollback, fee rounding and multiple sales, donated balances, fresh token-only liquidity, empty liquidity with a positive minimum output, revoked LP withdrawals and fee collection, ownership and buy liveness |
@@ -54,7 +57,7 @@ This review is independent of the implementation author's `SECURITY.md`. It revi
 - **Timing and reentrancy:** sale, appeal, objection, bond-timeout and silence deadlines have equality/adjacent-second cases. Partial votes and new pending pleas cannot restart silence. Late judging cannot reverse free trading. A pair-token callback cannot reenter `sell`; credit is cleared before an external claim transfer, preventing a second withdrawal. A failed swap or transfer rolls back accounting and allowances.
 - **Griefing:** a failed objection bond payment leaves the sale available to a later objector; duplicate objections/votes and repeated resolution/claim are rejected. An unruled bond is reclaimable at its deadline. A recipient refusing an IMD transfer cannot block buys or season rollover. Top-25 removal fairness fails as reported.
 
-Operational/design limits remain: an allowlisted shared position manager must enforce who can add liquidity; the hook sees that contract as the LP. The appeal limit is now enforced per seller: a replacement plea after a denial counts as the re-hearing, and it is tested against withdraw-and-resubmit laundering. Dead-man activation is lazy (see the low finding above), and an external caller may need to invoke `triggerDeadManSwitch` to persist its event. These are not strengthened into new passing guarantees here.
+Operational/design limits remain: an allowlisted shared position manager must enforce who can add liquidity; the hook sees that contract as the LP. The appeal limit is now enforced per seller: a replacement plea after a denial counts as the re-hearing, and it is tested against withdraw-and-resubmit laundering. Dead-man activation is lazy (views report it at once, and every state-changing entry point, `endSeason` included, latches it), and an external caller may need to invoke `triggerDeadManSwitch` to persist its event. These are not strengthened into new passing guarantees here.
 
 No fork block or RPC variable is specified by this assignment, so these tests run entirely offline with the actual vendored PoolManager and local pair tokens. A deployment rehearsal against the actual IMD token and launch factory remains outstanding. The hostile token mock probes failure paths; it does not claim that live IMD has callbacks, transfer fees, pausing, or false returns. No Slither, Mythril, or formal-verification result is claimed.
 

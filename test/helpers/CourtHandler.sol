@@ -310,7 +310,7 @@ contract CourtHandler is Test {
     function endSeason() public {
         if (block.timestamp < court.seasonStart() + 30 days) return;
         uint256 ended = court.season();
-        bool sweep = court.deadManTriggered();
+        bool sweep = court.tradesFreely(); // endSeason latches a due switch before choosing to sweep
         uint256 totalPoints;
         for (uint256 i; i < actors.length; ++i) {
             totalPoints += points[actors[i]];
