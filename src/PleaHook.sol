@@ -68,11 +68,9 @@ contract PleaHook is IUnlockCallback, Ownable, ReentrancyGuard {
     Currency public paired;
     /// @notice Share of every gated sale's IMD proceeds sent to the court's prize pot, in basis points.
     uint16 public potFeeBps;
-    /// @notice Addresses besides the factory that may add liquidity.
+    /// @notice Addresses besides the factory that may add liquidity. Only contracts whose liquidity is the
+    /// allowlisted party's own: a shared position manager would let any holder sell PLEA as liquidity.
     mapping(address => bool) public liquidityProviders;
-
-    /// @dev Transient-storage slot set while `sell` drives a swap, so beforeSwap knows the hook itself is the sender.
-    bytes32 private constant SELLING_SLOT = keccak256("plea.hook.selling");
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -137,15 +135,17 @@ contract PleaHook is IUnlockCallback, Ownable, ReentrancyGuard {
         return IHooks.beforeAddLiquidity.selector;
     }
 
-    /// @notice Buys always pass. Sells pass only from this hook's own `sell`, or once trading is free.
-    function beforeSwap(address sender, PoolKey calldata, SwapParams calldata params, bytes calldata)
+    /// @notice Buys always pass. Every sell that reaches this callback is refused until trading is free: the
+    /// only permitted sell route is this hook's own `sell`, and the PoolManager never calls a hook for a
+    /// swap the hook itself initiates (v4-core's `noSelfCall`), so `sell` is never seen here.
+    function beforeSwap(address, PoolKey calldata, SwapParams calldata params, bytes calldata)
         external
         view
         onlyPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         bool isSell = params.zeroForOne == tokenIsCurrency0;
-        if (isSell && !(sender == address(this) && _isSelling()) && !court.tradesFreely()) revert SellRequiresPlea();
+        if (isSell && !court.tradesFreely()) revert SellRequiresPlea();
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
@@ -153,24 +153,26 @@ contract PleaHook is IUnlockCallback, Ownable, ReentrancyGuard {
 
     /// @notice Sells `amountIn` PLEA for IMD through the pool, inside the caller's approved sale window.
     /// The pot fee comes off the IMD proceeds; the rest goes to the caller, who must receive `minOut`.
-    /// Once the dead-man switch has fired, no plea is needed (any router works then too).
+    /// Only the PLEA the pool consumed is charged to the window and recorded as the sale; the rest is
+    /// refunded. Once the dead-man switch has fired, no plea is needed and no pot fee is taken (any
+    /// router works then too).
     function sell(uint256 amountIn, uint256 minOut) external nonReentrant returns (uint256 saleId, uint256 amountOut) {
         if (!bound) revert NotBound();
         if (amountIn == 0) revert ZeroAmount();
         bool free = court.tradesFreely();
         if (!free) saleId = court.authorizeSale(msg.sender, amountIn);
         IERC20(token).safeTransferFrom(msg.sender, address(this), amountIn);
-        _setSelling(true);
-        bytes memory result = poolManager.unlock(abi.encode(msg.sender, amountIn, minOut));
-        _setSelling(false);
+        bytes memory result = poolManager.unlock(abi.encode(msg.sender, amountIn, minOut, free));
         (uint256 consumed, uint256 out, uint256 fee) = abi.decode(result, (uint256, uint256, uint256));
+        if (!free) court.settleSale(saleId, consumed);
         if (consumed < amountIn) IERC20(token).safeTransfer(msg.sender, amountIn - consumed);
         amountOut = out - fee;
         emit SellExecuted(saleId, msg.sender, consumed, amountOut, fee, free);
     }
 
     function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
-        (address seller, uint256 amountIn, uint256 minOut) = abi.decode(data, (address, uint256, uint256));
+        (address seller, uint256 amountIn, uint256 minOut, bool free) =
+            abi.decode(data, (address, uint256, uint256, bool));
         bool zeroForOne = tokenIsCurrency0;
         BalanceDelta delta = poolManager.swap(
             _poolKey,
@@ -185,7 +187,7 @@ contract PleaHook is IUnlockCallback, Ownable, ReentrancyGuard {
         int128 pairedDelta = zeroForOne ? delta.amount1() : delta.amount0();
         uint256 consumed = uint256(uint128(-tokenDelta));
         uint256 out = uint256(uint128(pairedDelta));
-        uint256 fee = out * potFeeBps / BPS;
+        uint256 fee = free ? 0 : out * potFeeBps / BPS;
         if (out - fee < minOut) revert InsufficientOutput(out - fee, minOut);
 
         Currency tokenCurrency = Currency.wrap(token);
@@ -197,20 +199,6 @@ contract PleaHook is IUnlockCallback, Ownable, ReentrancyGuard {
         return abi.encode(consumed, out, fee);
     }
 
-    function _setSelling(bool on) private {
-        bytes32 slot = SELLING_SLOT;
-        assembly ("memory-safe") {
-            tstore(slot, on)
-        }
-    }
-
-    function _isSelling() private view returns (bool on) {
-        bytes32 slot = SELLING_SLOT;
-        assembly ("memory-safe") {
-            on := tload(slot)
-        }
-    }
-
     // ------------------------------------------------------------------ owner
 
     /// @notice Sets the share of gated sale proceeds that funds the season prize pot (max 10%).
@@ -220,7 +208,10 @@ contract PleaHook is IUnlockCallback, Ownable, ReentrancyGuard {
         emit PotFeeSet(bps);
     }
 
-    /// @notice Allows or disallows an address (a position manager, say) to add liquidity.
+    /// @notice Allows or disallows an address to add liquidity. The callback sees the contract that calls
+    /// `modifyLiquidity`, not the end liquidity provider, so allowlist only a wallet or a contract whose
+    /// positions are its own (the factory's), never a shared position manager or router: through one, any
+    /// PLEA holder could add single-sided PLEA liquidity and withdraw IMD, which is a sell without a plea.
     function setLiquidityProvider(address provider, bool allowed) external onlyOwner {
         liquidityProviders[provider] = allowed;
         emit LiquidityProviderSet(provider, allowed);

@@ -19,6 +19,7 @@ contract Letterbox is EIP712 {
     error BadSignature();
 
     event Posted(uint256 indexed pleaId, address indexed seller, address indexed poster);
+    event NonceInvalidated(address indexed seller, uint256 nonce);
 
     IPleaIntake public immutable court;
     mapping(address => uint256) public nonces;
@@ -49,6 +50,12 @@ contract Letterbox is EIP712 {
         if (ECDSA.recover(digest, signature) != seller) revert BadSignature();
         pleaId = court.submitPleaFor(seller, text, amount);
         emit Posted(pleaId, seller, msg.sender);
+    }
+
+    /// @notice Cancels every plea the caller signed with their current nonce, by spending it.
+    function invalidateNonce() external returns (uint256 nonce) {
+        nonce = nonces[msg.sender]++;
+        emit NonceInvalidated(msg.sender, nonce);
     }
 
     /// @notice The EIP-712 domain separator, for signers.

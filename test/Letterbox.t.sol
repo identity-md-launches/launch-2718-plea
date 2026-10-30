@@ -65,6 +65,20 @@ contract LetterboxTest is PleaBase {
         letterbox.postSigned(signer, "signed plea", 7, deadline, sig);
     }
 
+    function test_invalidateNonceCancelsASignedPlea() public {
+        uint256 deadline = block.timestamp + 30 days;
+        bytes memory sig = _sign(signer, "old", 1e18, 0, deadline);
+        vm.prank(signer);
+        vm.expectEmit(true, true, true, true);
+        emit Letterbox.NonceInvalidated(signer, 0);
+        letterbox.invalidateNonce();
+        assertEq(letterbox.nonces(signer), 1);
+        vm.prank(stranger);
+        vm.expectRevert(Letterbox.BadSignature.selector);
+        letterbox.postSigned(signer, "old", 1e18, deadline, sig);
+        assertEq(court.activePlea(signer), 0);
+    }
+
     function test_onlyLetterboxMaySubmitFor() public {
         vm.prank(stranger);
         vm.expectRevert(PleaCourt.NotHook.selector);

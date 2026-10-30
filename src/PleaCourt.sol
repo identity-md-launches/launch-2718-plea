@@ -53,6 +53,15 @@ contract PleaCourt is IPleaCourt {
     uint256 public constant OBJECTION_BAN = 7 days;
     /// @notice Longest plea text, in bytes (chosen).
     uint256 public constant MAX_PLEA_BYTES = 1000;
+    /// @notice A seller whose re-hearing (appeal or replacement plea) was also denied waits this long before
+    /// pleading again (chosen).
+    uint256 public constant DENIAL_COOLDOWN = 24 hours;
+    /// @notice Season prizes unlock this long after the season ends: longer than a sale window, an objection
+    /// window and a ruling period together, so every objection to the season's sales is ruled first (chosen).
+    uint256 public constant PRIZE_LOCK = 3 days;
+    /// @notice Entries the board keeps so a struck winner is replaced by the next eligible seller: the top 25
+    /// plus a bench of the next 25.
+    uint256 public constant BOARD_CAPACITY = 2 * TOP_N;
 
     // ------------------------------------------------------------------ errors
 
@@ -69,10 +78,17 @@ contract PleaCourt is IPleaCourt {
     error EmptyPlea();
     error PleaTooLong();
     error ZeroAmount();
+    error AmountTooLarge();
     error ActivePleaExists(uint256 pleaId);
     error Banned(uint64 until);
+    error PleaTooEarly(uint64 earliest);
     error WrongStatus(Status status);
     error AlreadyVoted();
+    error VotesCast();
+    error Recused();
+    error SelfObjection();
+    error RulingPeriodOver();
+    error PrizeLocked(uint64 unlockAt);
     error ScoreTooHigh();
     error FactPointsTooHigh();
     error AlreadyAppealed();
@@ -115,6 +131,7 @@ contract PleaCourt is IPleaCourt {
     );
     event PleaAppealed(uint256 indexed pleaId, address indexed seller, uint8 round);
     event PleaWithdrawn(uint256 indexed pleaId, address indexed seller);
+    event PleaStruck(uint256 indexed pleaId, address indexed seller);
     event SaleWindowOpened(uint256 indexed pleaId, address indexed seller, uint256 amount, uint64 expiry);
     event SaleWindowClosed(uint256 indexed pleaId, address indexed seller, uint256 sold, bool expired);
     event SaleRecorded(uint256 indexed saleId, uint256 indexed pleaId, address indexed seller, uint256 amount);
@@ -127,6 +144,9 @@ contract PleaCourt is IPleaCourt {
     event PointsAwarded(uint256 indexed season, address indexed account, uint256 points, uint256 total);
     event SeasonEnded(uint256 indexed season, uint256 pot, uint256 winners, uint256 nextSeasonStart);
     event PrizeAwarded(uint256 indexed season, address indexed account, uint256 amount);
+    event PrizeForfeited(uint256 indexed season, address indexed account, uint256 amount);
+    event PrizeClaimed(uint256 indexed season, address indexed account, uint256 amount);
+    event PotSwept(uint256 indexed season, address indexed to, uint256 amount);
     event Claimed(address indexed account, uint256 amount);
     event DeadManSwitchTriggered(uint64 at, uint64 deadline);
 
@@ -151,6 +171,11 @@ contract PleaCourt is IPleaCourt {
     mapping(address => uint256) public activePlea;
     mapping(uint256 => mapping(uint8 => mapping(address => bool))) public hasScored;
     mapping(uint256 => mapping(uint8 => uint16[])) private _scores;
+    /// @notice Earliest time a seller may plead again after a denial.
+    mapping(address => uint64) public nextPleaAt;
+    /// @notice True after a first denial until the seller's one re-hearing has been heard: the next plea
+    /// the seller submits is that re-hearing and cannot be appealed.
+    mapping(address => bool) public rehearingOwed;
 
     uint256 public saleCount;
     mapping(uint256 => Sale) private _sales;
@@ -170,7 +195,13 @@ contract PleaCourt is IPleaCourt {
     uint64 public seasonStart;
     Entry[] private _board;
     mapping(uint256 => mapping(address => uint256)) public seasonPoints;
+    /// @notice When each ended season ended; zero while it has not.
+    mapping(uint256 => uint64) public seasonEndedAt;
+    /// @notice Unclaimed season prizes, locked until `prizeUnlockAt(season)` and forfeited by a strike.
+    mapping(uint256 => mapping(address => uint256)) public prizeCredit;
+    /// @notice Immediately claimable IMD: returned bonds and the post-switch pot sweep.
     mapping(address => uint256) public claimable;
+    /// @notice Everything credited and not yet paid out, prizes included.
     uint256 public totalClaimable;
 
     // ------------------------------------------------------------------ modifiers
@@ -205,10 +236,12 @@ contract PleaCourt is IPleaCourt {
         emit Bound(imd_);
     }
 
-    /// @notice Spends `amount` of `seller`'s open sale window. Reverts unless the seller holds an approved
-    /// plea whose window is open and whose approved amount covers it.
+    /// @notice Reserves `amount` of `seller`'s open sale window for a sale the hook is about to execute.
+    /// Reverts unless the seller holds an approved plea whose window is open and whose approved amount
+    /// covers it, and is not banned. The hook settles the sale with `settleSale` in the same transaction.
     function authorizeSale(address seller, uint256 amount) external onlyHook returns (uint256 saleId) {
         _latchDeadMan();
+        if (bannedUntil[seller] > block.timestamp) revert Banned(bannedUntil[seller]);
         uint256 pleaId = activePlea[seller];
         Plea storage p = _pleas[pleaId];
         if (pleaId == 0 || p.status != Status.Approved) revert NoApprovedPlea();
@@ -222,10 +255,22 @@ contract PleaCourt is IPleaCourt {
             seller: seller,
             amount: uint128(amount),
             executedAt: uint64(block.timestamp),
-            objected: false
+            objected: false,
+            season: p.season
         });
-        emit SaleRecorded(saleId, pleaId, seller, amount);
-        if (p.sold == p.amount) _closeWindow(pleaId, p, false);
+    }
+
+    /// @notice Settles a reserved sale to the PLEA the pool consumed: the unconsumed rest of the
+    /// reservation returns to the window, and the window closes once the whole approved amount is sold.
+    function settleSale(uint256 saleId, uint256 consumed) external onlyHook {
+        Sale storage s = _sales[saleId];
+        if (s.seller == address(0)) revert NoSuchSale();
+        Plea storage p = _pleas[s.pleaId];
+        if (consumed > s.amount) revert ExceedsApprovedAmount(s.amount);
+        p.sold -= uint128(s.amount - consumed);
+        s.amount = uint128(consumed);
+        emit SaleRecorded(saleId, s.pleaId, s.seller, consumed);
+        if (p.status == Status.Approved && p.sold == p.amount) _closeWindow(s.pleaId, p, false);
     }
 
     // ------------------------------------------------------------------ owner
@@ -272,10 +317,13 @@ contract PleaCourt is IPleaCourt {
     {
         _latchDeadMan();
         if (deadManTriggered) revert FreeTrading();
-        if (amount == 0 || amount > type(uint128).max) revert ZeroAmount();
+        if (!cabalConfigured()) revert CabalNotConfigured();
+        if (amount == 0) revert ZeroAmount();
+        if (amount > type(uint128).max) revert AmountTooLarge();
         if (bytes(text).length == 0) revert EmptyPlea();
         if (bytes(text).length > MAX_PLEA_BYTES) revert PleaTooLong();
         if (bannedUntil[seller] > block.timestamp) revert Banned(bannedUntil[seller]);
+        if (nextPleaAt[seller] > block.timestamp) revert PleaTooEarly(nextPleaAt[seller]);
         uint256 active = activePlea[seller];
         if (active != 0) revert ActivePleaExists(active);
 
@@ -285,6 +333,8 @@ contract PleaCourt is IPleaCourt {
         p.amount = uint128(amount);
         p.submittedAt = uint64(block.timestamp);
         p.round = 1;
+        // a plea after a denial is the seller's one re-hearing: it cannot be appealed in turn
+        p.appealed = rehearingOwed[seller];
         p.status = Status.Pending;
         pleaText[pleaId] = text;
         activePlea[seller] = pleaId;
@@ -295,12 +345,15 @@ contract PleaCourt is IPleaCourt {
     /// @notice A judge's score for a pending plea. `score` is 0-45; `factPoints` are the verifiable facts the
     /// judge credits, each lowering the bar by one from 71. Seat holders' scores are scaled by 1.2. The
     /// judge approves when the scaled score reaches `71 - factPoints`. Once 17 judges share a side the
-    /// median is settled and the verdict is final.
+    /// median is settled and the verdict is final. When the whole Cabal has voted and neither side has
+    /// 17, the plea is denied (approval needs 17 to agree) and the seller may appeal. A judge never
+    /// scores their own plea.
     function judge(uint256 pleaId, uint8 score, uint8 factPoints) external onlyJudge {
         _latchDeadMan();
         if (deadManTriggered) revert FreeTrading();
         Plea storage p = _pleas[pleaId];
         if (p.status != Status.Pending) revert WrongStatus(p.status);
+        if (msg.sender == p.seller) revert Recused();
         if (score > MAX_SCORE) revert ScoreTooHigh();
         if (factPoints > MAX_FACT_POINTS) revert FactPointsTooHigh();
         uint8 round = p.round;
@@ -316,6 +369,7 @@ contract PleaCourt is IPleaCourt {
 
         if (p.approveVotes >= QUORUM) _decide(pleaId, p, true);
         else if (p.denyVotes >= QUORUM) _decide(pleaId, p, false);
+        else if (uint256(p.approveVotes) + p.denyVotes >= JUDGE_COUNT) _decide(pleaId, p, false); // hung Cabal
     }
 
     function _decide(uint256 pleaId, Plea storage p, bool approved) internal {
@@ -327,11 +381,22 @@ contract PleaCourt is IPleaCourt {
         emit Verdict(pleaId, p.seller, p.round, approved, median, p.approveVotes, p.denyVotes);
         if (approved) {
             p.status = Status.Approved;
+            p.season = uint64(season);
             p.windowExpiry = uint64(block.timestamp + SALE_WINDOW);
+            rehearingOwed[p.seller] = false;
             _award(p.seller, median);
             emit SaleWindowOpened(pleaId, p.seller, p.amount, p.windowExpiry);
         } else {
             p.status = Status.Denied;
+            if (p.appealed) {
+                // the re-hearing failed too: a fresh plea only after the cooldown
+                rehearingOwed[p.seller] = false;
+                nextPleaAt[p.seller] = uint64(block.timestamp + DENIAL_COOLDOWN);
+            } else {
+                // one re-hearing, as an appeal or a replacement plea, and not before 4 hours
+                rehearingOwed[p.seller] = true;
+                nextPleaAt[p.seller] = uint64(block.timestamp + APPEAL_DELAY);
+            }
         }
     }
 
@@ -343,6 +408,7 @@ contract PleaCourt is IPleaCourt {
         if (p.appealed) revert AlreadyAppealed();
         _latchDeadMan();
         if (deadManTriggered) revert FreeTrading();
+        if (bannedUntil[p.seller] > block.timestamp) revert Banned(bannedUntil[p.seller]);
         uint64 earliest = p.decidedAt + uint64(APPEAL_DELAY);
         if (block.timestamp < earliest) revert AppealTooEarly(earliest);
         p.appealed = true;
@@ -356,15 +422,33 @@ contract PleaCourt is IPleaCourt {
     }
 
     /// @notice Withdraws a pending or denied plea so the seller can submit another. Forfeits any appeal.
+    /// A pending plea the Cabal has started to score cannot be withdrawn: its verdict is owed, and the
+    /// denial's cooldown applies to the seller's next plea whether or not this one is withdrawn.
     function withdrawPlea(uint256 pleaId) external {
         Plea storage p = _pleas[pleaId];
         if (msg.sender != p.seller) revert NotSeller();
         _latchDeadMan();
-        if (p.status == Status.Pending) _leavePending();
-        else if (p.status != Status.Denied) revert WrongStatus(p.status);
+        if (p.status == Status.Pending) {
+            if (!deadManTriggered && _scores[pleaId][p.round].length != 0) revert VotesCast();
+            _leavePending();
+        } else if (p.status != Status.Denied) {
+            revert WrongStatus(p.status);
+        }
         p.status = Status.Withdrawn;
         activePlea[p.seller] = 0;
         emit PleaWithdrawn(pleaId, p.seller);
+    }
+
+    /// @dev An upheld objection ends whatever plea the seller has in flight.
+    function _strikeActivePlea(address seller) internal {
+        uint256 pleaId = activePlea[seller];
+        if (pleaId == 0) return;
+        Plea storage p = _pleas[pleaId];
+        if (p.status == Status.Pending) _leavePending();
+        else if (p.status == Status.Approved) emit SaleWindowClosed(pleaId, seller, p.sold, false);
+        p.status = Status.Struck;
+        activePlea[seller] = 0;
+        emit PleaStruck(pleaId, seller);
     }
 
     /// @notice Closes an approved plea whose 7-minute window has passed, freeing the seller to plead again.
@@ -383,10 +467,12 @@ contract PleaCourt is IPleaCourt {
 
     // ------------------------------------------------------------------ objections
 
-    /// @notice Objects to a sale within 20 minutes of its execution, posting the IMD bond.
+    /// @notice Objects to a sale within 20 minutes of its execution, posting the IMD bond. The seller cannot
+    /// object to their own sale.
     function object(uint256 saleId) external returns (uint256 objectionId) {
         Sale storage s = _sales[saleId];
         if (s.seller == address(0)) revert NoSuchSale();
+        if (msg.sender == s.seller) revert SelfObjection();
         if (s.objected) revert AlreadyObjected();
         if (block.timestamp > s.executedAt + OBJECTION_WINDOW) revert ObjectionWindowClosed();
         if (address(imd) == address(0)) revert NotBound();
@@ -407,12 +493,18 @@ contract PleaCourt is IPleaCourt {
         imd.safeTransferFrom(msg.sender, address(this), OBJECTION_BOND);
     }
 
-    /// @notice A judge's ruling on an objection. 17 upholds ban the seller and void their season points;
-    /// 17 dismissals forfeit the objector's bond to the pot.
+    /// @notice A judge's ruling on an objection, within the ruling period. 17 upholds ban the seller, void
+    /// the season points of the sale's season (or forfeit the prize they already earned), and strike the
+    /// seller's plea in flight; 17 dismissals forfeit the objector's bond to the pot. The sale's seller and
+    /// the objector never rule.
     function ruleObjection(uint256 objectionId, bool uphold) external onlyJudge {
+        _latchDeadMan();
         Objection storage o = _objections[objectionId];
         if (o.objector == address(0)) revert NoSuchSale();
         if (o.resolved) revert ObjectionResolvedAlready();
+        if (block.timestamp > o.openedAt + OBJECTION_RULING_PERIOD) revert RulingPeriodOver();
+        Sale storage s = _sales[o.saleId];
+        if (msg.sender == s.seller || msg.sender == o.objector) revert Recused();
         if (hasRuled[objectionId][msg.sender]) revert AlreadyVoted();
         hasRuled[objectionId][msg.sender] = true;
         if (uphold) o.upholdVotes += 1;
@@ -422,10 +514,11 @@ contract PleaCourt is IPleaCourt {
         if (o.upholdVotes >= QUORUM) {
             o.resolved = true;
             o.upheld = true;
-            address seller = _sales[o.saleId].seller;
+            address seller = s.seller;
             uint64 until = uint64(block.timestamp + OBJECTION_BAN);
             bannedUntil[seller] = until;
-            _strike(seller);
+            _strike(seller, s.season);
+            _strikeActivePlea(seller);
             _returnBond(o);
             emit SellerBanned(seller, until);
             emit ObjectionResolved(objectionId, o.saleId, true, false);
@@ -455,35 +548,61 @@ contract PleaCourt is IPleaCourt {
 
     // ------------------------------------------------------------------ seasons
 
-    /// @notice Ends the season once its length has passed: the prize pot is split among the leaderboard,
-    /// pro rata to points, as claimable IMD. An empty leaderboard rolls the pot into the next season.
+    /// @notice Ends the season once its length has passed: the prize pot is split among the top 25 of the
+    /// leaderboard, pro rata to points, as prize credits that unlock after `PRIZE_LOCK` (`claimPrize`).
+    /// An empty leaderboard rolls the pot into the next season, except after the dead-man switch, when
+    /// nobody can earn points again: what the board does not take is credited to the hook's owner.
     function endSeason() external {
         uint64 endsAt = seasonStart + uint64(SEASON_LENGTH);
         if (block.timestamp < endsAt) revert SeasonNotOver(endsAt);
         uint256 pot = prizePot();
         uint256 ended = season;
-        uint256 n = _board.length;
+        Entry[] memory top = _sorted(TOP_N);
+        uint256 n = top.length;
         uint256 totalPoints;
         for (uint256 i = 0; i < n; i++) {
-            totalPoints += _board[i].points;
+            totalPoints += top[i].points;
         }
         uint256 winners;
+        uint256 paid;
         if (pot > 0 && totalPoints > 0) {
             for (uint256 i = 0; i < n; i++) {
-                uint256 share = pot * _board[i].points / totalPoints;
+                uint256 share = pot * top[i].points / totalPoints;
                 if (share == 0) continue;
                 winners++;
-                _credit(_board[i].account, share);
-                emit PrizeAwarded(ended, _board[i].account, share);
+                paid += share;
+                prizeCredit[ended][top[i].account] += share;
+                totalClaimable += share;
+                emit PrizeAwarded(ended, top[i].account, share);
             }
         }
         delete _board;
+        seasonEndedAt[ended] = uint64(block.timestamp);
         season = ended + 1;
         seasonStart = uint64(block.timestamp);
         emit SeasonEnded(ended, pot, winners, block.timestamp);
+        if (deadManTriggered && pot > paid) {
+            address to = IOwned(hook).owner();
+            if (to != address(0)) {
+                _credit(to, pot - paid);
+                emit PotSwept(ended, to, pot - paid);
+            }
+        }
     }
 
-    /// @notice Pays out everything credited to the caller: prizes and returned bonds.
+    /// @notice Pays out the caller's prize of an ended season once its lock has passed.
+    function claimPrize(uint256 season_) external {
+        uint64 unlockAt = prizeUnlockAt(season_);
+        if (unlockAt == 0 || block.timestamp < unlockAt) revert PrizeLocked(unlockAt);
+        uint256 amount = prizeCredit[season_][msg.sender];
+        if (amount == 0) revert NothingToClaim();
+        prizeCredit[season_][msg.sender] = 0;
+        totalClaimable -= amount;
+        emit PrizeClaimed(season_, msg.sender, amount);
+        imd.safeTransfer(msg.sender, amount);
+    }
+
+    /// @notice Pays out everything immediately claimable by the caller: returned bonds and pot sweeps.
     function claim() external {
         uint256 amount = claimable[msg.sender];
         if (amount == 0) revert NothingToClaim();
@@ -516,20 +635,30 @@ contract PleaCourt is IPleaCourt {
                 minIdx = i;
             }
         }
-        if (n < TOP_N) _board.push(Entry({account: account, points: total}));
+        if (n < BOARD_CAPACITY) _board.push(Entry({account: account, points: total}));
         else if (total > minPts) _board[minIdx] = Entry({account: account, points: total});
         emit PointsAwarded(season, account, pts, total);
     }
 
-    function _strike(address account) internal {
-        seasonPoints[season][account] = 0;
-        uint256 n = _board.length;
-        for (uint256 i = 0; i < n; i++) {
-            if (_board[i].account == account) {
-                _board[i] = _board[n - 1];
-                _board.pop();
-                break;
+    /// @dev Voids `account`'s points of `season_`: off the board while that season runs (the bench entry
+    /// behind them moves up), or the prize credited to them once it has ended, back into the pot.
+    function _strike(address account, uint256 season_) internal {
+        if (season_ == season) {
+            seasonPoints[season][account] = 0;
+            uint256 n = _board.length;
+            for (uint256 i = 0; i < n; i++) {
+                if (_board[i].account == account) {
+                    _board[i] = _board[n - 1];
+                    _board.pop();
+                    break;
+                }
             }
+        } else {
+            uint256 amount = prizeCredit[season_][account];
+            if (amount == 0) return;
+            prizeCredit[season_][account] = 0;
+            totalClaimable -= amount;
+            emit PrizeForfeited(season_, account, amount);
         }
     }
 
@@ -626,9 +755,25 @@ contract PleaCourt is IPleaCourt {
         return (season, seasonStart, seasonStart + uint64(SEASON_LENGTH));
     }
 
-    /// @notice The season leaderboard, highest points first, at most 25 entries.
-    function leaderboard() external view returns (Entry[] memory sorted) {
-        sorted = _board;
+    /// @notice The season leaderboard, highest points first, at most 25 entries: the winners if the season
+    /// ended now.
+    function leaderboard() external view returns (Entry[] memory) {
+        return _sorted(TOP_N);
+    }
+
+    /// @notice The whole board, highest points first: the top 25 and the bench behind them.
+    function fullBoard() external view returns (Entry[] memory) {
+        return _sorted(BOARD_CAPACITY);
+    }
+
+    /// @notice When the prizes of an ended season unlock; zero while the season has not ended.
+    function prizeUnlockAt(uint256 season_) public view returns (uint64) {
+        uint64 endedAt = seasonEndedAt[season_];
+        return endedAt == 0 ? 0 : endedAt + uint64(PRIZE_LOCK);
+    }
+
+    function _sorted(uint256 limit) internal view returns (Entry[] memory top) {
+        Entry[] memory sorted = _board;
         uint256 n = sorted.length;
         for (uint256 i = 1; i < n; i++) {
             Entry memory e = sorted[i];
@@ -638,6 +783,11 @@ contract PleaCourt is IPleaCourt {
                 j--;
             }
             sorted[j] = e;
+        }
+        if (n <= limit) return sorted;
+        top = new Entry[](limit);
+        for (uint256 i = 0; i < limit; i++) {
+            top[i] = sorted[i];
         }
     }
 

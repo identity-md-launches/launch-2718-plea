@@ -233,20 +233,27 @@ contract PleaCourtTest is PleaBase {
         vm.prank(seller);
         court.appeal(id);
         denyPlea(id);
+        // the failed re-hearing starts the cooldown, withdrawn or not
+        uint64 cooldownEnd = uint64(block.timestamp + 24 hours);
+        assertEq(court.nextPleaAt(seller), cooldownEnd);
         vm.warp(block.timestamp + 4 hours);
         vm.prank(seller);
         vm.expectRevert(PleaCourt.AlreadyAppealed.selector);
         court.appeal(id);
-        // a denied plea blocks a new one until withdrawn
         vm.prank(seller);
-        vm.expectRevert(abi.encodeWithSelector(PleaCourt.ActivePleaExists.selector, id));
+        vm.expectRevert(abi.encodeWithSelector(PleaCourt.PleaTooEarly.selector, cooldownEnd));
         court.submitPlea("new", 1);
         vm.prank(seller);
         vm.expectEmit(true, true, true, true);
         emit PleaCourt.PleaWithdrawn(id, seller);
         court.withdrawPlea(id);
         vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(PleaCourt.PleaTooEarly.selector, cooldownEnd));
         court.submitPlea("new", 1);
+        vm.warp(cooldownEnd);
+        vm.prank(seller);
+        uint256 fresh = court.submitPlea("new", 1);
+        assertFalse(court.plea(fresh).appealed, "a plea after the cooldown is a first hearing again");
     }
 
     function test_appealOfApprovedReverts() public {
@@ -435,20 +442,36 @@ contract PleaCourtTest is PleaBase {
         vm.expectEmit(true, true, true, true);
         emit PleaCourt.SeasonEnded(1, 75e18, 2, block.timestamp);
         court.endSeason();
-        assertEq(court.claimable(seller), 45e18);
-        assertEq(court.claimable(second), 30e18);
+        assertEq(court.prizeCredit(1, seller), 45e18);
+        assertEq(court.prizeCredit(1, second), 30e18);
+        assertEq(court.claimable(seller), 0, "prizes are not immediately claimable");
         assertEq(court.prizePot(), 0);
         (uint256 id,,) = hook.currentSeason();
         assertEq(id, 2);
         assertEq(hook.leaderboard().length, 0);
+        // prizes unlock 3 days after the season end, once every objection to its sales is ruled
+        uint64 unlockAt = uint64(block.timestamp + 3 days);
+        assertEq(court.prizeUnlockAt(1), unlockAt);
+        assertEq(court.prizeUnlockAt(2), 0);
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(PleaCourt.PrizeLocked.selector, unlockAt));
+        court.claimPrize(1);
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(PleaCourt.PrizeLocked.selector, 0));
+        court.claimPrize(2);
+        vm.warp(unlockAt);
         vm.prank(seller);
         vm.expectEmit(true, true, true, true);
-        emit PleaCourt.Claimed(seller, 45e18);
-        court.claim();
+        emit PleaCourt.PrizeClaimed(1, seller, 45e18);
+        court.claimPrize(1);
         assertEq(imd.balanceOf(seller), 45e18);
+        vm.prank(seller);
+        vm.expectRevert(PleaCourt.NothingToClaim.selector);
+        court.claimPrize(1);
         vm.prank(second);
-        court.claim();
+        court.claimPrize(1);
         assertEq(imd.balanceOf(address(court)), 0);
+        assertEq(court.totalClaimable(), 0);
     }
 
     function test_emptySeasonRollsPotOver() public {

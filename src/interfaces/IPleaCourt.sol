@@ -9,7 +9,8 @@ interface IPleaCourt {
         Approved,
         Denied,
         Closed,
-        Withdrawn
+        Withdrawn,
+        Struck
     }
 
     struct Plea {
@@ -20,11 +21,14 @@ interface IPleaCourt {
         uint64 decidedAt;
         uint64 windowExpiry;
         uint8 round;
+        /// @dev True once the seller's one re-hearing is used: an appeal, or a fresh plea after a denial.
         bool appealed;
         Status status;
         uint16 approveVotes;
         uint16 denyVotes;
         uint16 medianScore;
+        /// @dev The season the approval's points were awarded in; zero until approved.
+        uint64 season;
     }
 
     struct Sale {
@@ -33,6 +37,8 @@ interface IPleaCourt {
         uint128 amount;
         uint64 executedAt;
         bool objected;
+        /// @dev The season of the plea's points, which an upheld objection strikes.
+        uint64 season;
     }
 
     struct Objection {
