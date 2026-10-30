@@ -1,0 +1,30 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "PleaHook",
+    "constructorArgs": [
+      "$poolManager",
+      "$token",
+      "$owner",
+      "$factory"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeAddLiquidity",
+      "beforeSwap"
+    ]
+  },
+  "token": {
+    "contract": "PLEAToken",
+    "name": "PLEA",
+    "symbol": "PLEA",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "PLEA ($PLEA, X @plea_imd) is a meme token paired with IMD on Uniswap v4; the hook gates sells, never buys. PLEAToken (src/PLEAToken.sol) is a fixed-supply OpenZeppelin ERC-20 with no constructor arguments, no owner, mint, pause, blocklist, fee or upgrade; it mints its supply once to its deployer, the launch factory. PleaHook (src/PleaHook.sol) takes (IPoolManager poolManager, address token, address owner, address factory) in that order; it is Ownable with $owner as initial owner, and its constructor creates PleaCourt, which creates Letterbox. Permissions returned by getHookPermissions: beforeInitialize, beforeAddLiquidity, beforeSwap only (address flags 0x2880); no afterSwap, no remove-liquidity callbacks and no return-delta flags, so there is no NoOp surface and the factory's zero-liquidity fee collect is never intercepted. beforeInitialize accepts only the PoolManager as caller and only the launch factory as sender, once, for a pool containing $token; it records the other currency (IMD) as the pair and accepts the listed LP fee 12500 and tick spacing 60 (it does not restrict fee or spacing). beforeAddLiquidity admits the factory, owner-allowlisted providers, or anyone once trading is free, which closes the single-sided PLEA liquidity bypass of the sell gate. beforeSwap lets every buy (IMD in, PLEA out, exact input or output, any router) through and reverts any sell unless the sender is the hook itself inside its own sell() or the dead-man switch has fired. sell(amountIn, minOut) spends the caller's approved plea window (7 minutes, up to the plea's amount) by swapping exact input inside the hook's own unlock, pays an owner-set pot fee (potFeeBps, 0 at launch, max 10%) in IMD to the court via take, and takes the rest of the IMD to the seller. Pool LP fee is the policy's 12500 (1.25%); the hook neither overrides nor taxes it. PleaCourt holds pleas (direct or via Letterbox, plain or EIP-712 signed), a 30-judge Cabal with 17 agreeing to settle the median score, bar 71 minus fact points, 1.2x seat multiplier, one appeal 4 hours after denial, objections within 20 minutes of a sale with a 1 IMD bond, 30-day seasons whose top 25 split the IMD prize pot, and the 33-hour dead-man switch that permanently frees trading and liquidity. Events for plea submitted, judge scores, verdict, appeal, objection raised/ruled/resolved, sale window opened/closed, sale recorded, season end, prize awarded and dead-man switch triggered are emitted; the hook exposes pleaStatus, saleWindowExpiry, currentSeason, leaderboard, deadManTimer and tradesFreely for the frontend. Owner powers after launch (court.setJudges, court.setSeat, hook.setPotFeeBps, hook.setLiquidityProvider) are held by $owner; the judges are IMD's oracle addresses, which only the requester can supply, and they must be set before the first plea or within 33 hours of it, or PLEA trades freely forever. The owner can never block a buy, the factory's liquidity or fee collect, or move anyone's tokens. No contract is allocated or sent tokens at launch; the court only holds IMD deposited after launch (pot fees, bonds, transfers). The adversarial review is in SECURITY.md; its open items are an independent second review, a timelock or multisig as owner, and a fork rehearsal against mainnet IMD. The opening price is derived by the deployer from the policy's market cap; the hook does not check it."
+}
