@@ -2,15 +2,24 @@
 
 The original implementation and tests are unchanged. These additions test the court, signed plea intake, and real local Uniswap v4 swaps. They need only the already vendored dependencies; they use no RPC, environment-changing cheatcodes, ffi, network downloads, or files under `test/scratch/`.
 
-Two implementation defects are reported in `.imd-findings.json`, each with the full source of an independently runnable failing Foundry test. Those proofs were run against the current implementation before being embedded in the report. Their expected failures are not assertions blessing the defective behavior in the passing suite:
+## Revision round
 
-- **Medium — missing leaderboard promotion:** with 26 scored sellers, upholding an objection against a listed winner leaves 24 entries despite 25 eligible sellers. The omitted seller receives no season prize.
-- **Medium — partial-fill sale accounting:** a request for 1 PLEA consumes only `3042383861004483` wei in the proof's narrow-range pool, but the court records 1 PLEA sold and closes the window. Refunding tokens does not restore the remaining allowance.
+The implementation was revised to address the two findings this suite reported last round. Both are now fixed, and their proofs are kept as passing regression tests in `PleaCourtRevision.t.sol`:
+
+- **Leaderboard promotion (fixed):** the board now keeps a 25-entry bench. Striking the leader of 26 scored sellers lists the 26th, and that seller receives a prize.
+- **Partial-fill accounting (fixed):** the court now reserves a sale (`authorizeSale`) and settles it to the PLEA the pool consumed (`settleSale`). The unconsumed rest returns to the window.
+
+The court test driver now reserves and settles in one call, as the hook does. Three existing tests followed deliberate rule changes rather than defects: amounts above uint128 now revert with `AmountTooLarge`; a 15/15 vote is a hung denial that can be appealed; and prizes are locked credits paid by `claimPrize`. The invariant handler now models partial fills, re-hearings, cooldowns, struck pleas, the ruling period, prize locks, forfeiture of an ended season's prize, and the owner sweep after the switch.
+
+One new defect is reported in `.imd-findings.json` with a runnable proof:
+
+- **Low: dead-man sweep can be missed.** `endSeason` reads `deadManTriggered` without latching a switch that is already due. If the season ends after 33 hours of silence but before anyone latches the switch, the pot rolls over for a season instead of going to the owner. No funds are lost. No passing test asserts this behaviour.
 
 ## Test inventory
 
 | File | Coverage |
 | --- | --- |
+| `PleaCourtRevision.t.sol` | Regressions for both earlier findings (bench promotion, partial-fill settlement with a 1,000-run fuzz), settle rejections and rollback, re-hearing laundering through withdraw/resubmit and the Letterbox, 4 h and 24 h cooldown boundaries, withdrawal after votes, struck-seller ban boundaries, last-second ruling before prize unlock with forfeiture, claims for unended seasons |
 | `PleaCourtAdversarial.t.sol` | Input/type boundaries, ownership changes, invalid votes without state effects, odd/even and seat score rounding, quorum split and dead-man timing, appeal/window boundaries, objection failures and deadlines, prize rounding with bonds and prior claims reserved |
 | `LetterboxAdversarial.t.sol` | Mutations of every signed field, deadline equality, chain/address domain separation, malformed and high-s signatures, nonce rollback on court failure, retry and replay protection |
 | `PleaHookAdversarial.t.sol` | Both PLEA currency orderings; exact input/output sell-gate spoofing, allowance/slippage rollback, fee rounding and multiple sales, donated balances, fresh token-only liquidity, empty liquidity with a positive minimum output, revoked LP withdrawals and fee collection, ownership and buy liveness |
@@ -22,7 +31,7 @@ Fuzz tests added here use 1,000 runs. Each invariant campaign uses 256 runs at d
 
 The hook handler checks PoolManager's lock and outstanding currency deltas **inside the same handler call** as the swap, before transient storage is cleared by the transaction boundary. The court driver isolates court authorization; actual token settlement is exercised by the separate hook campaigns. No implementation storage is overwritten. CREATE2 deploys the real hook at its required permission bits and deploys pair tokens in both orderings.
 
-The court invariant uses six actors to test liabilities and the state machine. It does not claim to prove top-25 selection after a strike; that property fails and is reported. Hook conservation campaigns use full-range liquidity and bounded trades, while the failing partial-fill property is retained in the report. No partial-fill behavior is asserted as correct.
+The court invariant uses six actors to test liabilities and the state machine. Its board check compares every listed entry with an independent model of points, including strikes. Partial fills are fuzzed at the court level through the hook-only driver. Hook conservation campaigns use full-range liquidity and bounded trades.
 
 ## Five discovery passes
 
@@ -45,7 +54,7 @@ This review is independent of the implementation author's `SECURITY.md`. It revi
 - **Timing and reentrancy:** sale, appeal, objection, bond-timeout and silence deadlines have equality/adjacent-second cases. Partial votes and new pending pleas cannot restart silence. Late judging cannot reverse free trading. A pair-token callback cannot reenter `sell`; credit is cleared before an external claim transfer, preventing a second withdrawal. A failed swap or transfer rolls back accounting and allowances.
 - **Griefing:** a failed objection bond payment leaves the sale available to a later objector; duplicate objections/votes and repeated resolution/claim are rejected. An unruled bond is reclaimable at its deadline. A recipient refusing an IMD transfer cannot block buys or season rollover. Top-25 removal fairness fails as reported.
 
-Operational/design limits remain: an allowlisted shared position manager must enforce who can add liquidity; the hook sees that contract as the LP. The appeal limit is per plea ID: the existing implementation permits withdrawal of a denied plea and immediate new submission, so it does not enforce a seller-wide cooldown across new IDs. Dead-man activation is lazy, and an external caller may need to invoke `triggerDeadManSwitch` to persist its event. These are not strengthened into new passing guarantees here.
+Operational/design limits remain: an allowlisted shared position manager must enforce who can add liquidity; the hook sees that contract as the LP. The appeal limit is now enforced per seller: a replacement plea after a denial counts as the re-hearing, and it is tested against withdraw-and-resubmit laundering. Dead-man activation is lazy (see the low finding above), and an external caller may need to invoke `triggerDeadManSwitch` to persist its event. These are not strengthened into new passing guarantees here.
 
 No fork block or RPC variable is specified by this assignment, so these tests run entirely offline with the actual vendored PoolManager and local pair tokens. A deployment rehearsal against the actual IMD token and launch factory remains outstanding. The hostile token mock probes failure paths; it does not claim that live IMD has callbacks, transfer fees, pausing, or false returns. No Slither, Mythril, or formal-verification result is claimed.
 

@@ -21,6 +21,11 @@ contract CourtHandler is Test {
     uint256 public pot;
     uint256 public reservedBonds;
     mapping(address => uint256) public credits;
+    /// @dev Locked season prizes, by season, as the court should hold them.
+    mapping(uint256 => mapping(address => uint256)) public prizeCredits;
+    uint256 public prizesOutstanding;
+    uint256 public sweptToOwner;
+    uint256 public successfulPrizeClaims;
     mapping(address => uint256) public points;
     mapping(uint256 => mapping(uint8 => uint256[55])) internal histogram;
     bool public everFree;
@@ -52,7 +57,11 @@ contract CourtHandler is Test {
 
     function submit(uint256 seed, uint128 amountSeed, bool viaLetterbox) public {
         address who = actor(seed);
-        if (court.tradesFreely() || court.activePlea(who) != 0 || court.bannedUntil(who) > block.timestamp) return;
+        if (
+            court.tradesFreely() || court.activePlea(who) != 0 || court.bannedUntil(who) > block.timestamp
+                || court.nextPleaAt(who) > block.timestamp
+        ) return;
+        bool rehearing = court.rehearingOwed(who);
         uint256 amount = bound(amountSeed, 1, type(uint128).max);
         address box = address(court.letterbox());
         vm.prank(who);
@@ -64,6 +73,8 @@ contract CourtHandler is Test {
         } else {
             court.submitPlea("random plea", amount);
         }
+        // A plea filed while a re-hearing is owed is that re-hearing and cannot itself be appealed.
+        assertEq(court.plea(court.activePlea(who)).appealed, rehearing);
     }
 
     function judgeOne(uint256 seed, uint256 judgeSeed, uint8 scoreSeed, uint8 factSeed) public {
@@ -122,7 +133,7 @@ contract CourtHandler is Test {
         IPleaCourt.Plea memory p = court.plea(id);
         if (
             court.tradesFreely() || p.status != IPleaCourt.Status.Denied || p.appealed
-                || block.timestamp < p.decidedAt + 4 hours
+                || block.timestamp < p.decidedAt + 4 hours || court.bannedUntil(who) > block.timestamp
         ) return;
         vm.prank(who);
         court.appeal(id);
@@ -135,6 +146,13 @@ contract CourtHandler is Test {
         IPleaCourt.Plea memory p = court.plea(id);
         if (p.status == IPleaCourt.Status.Approved && block.timestamp > p.windowExpiry) {
             court.closeWindow(id);
+        } else if (
+            p.status == IPleaCourt.Status.Pending && court.scores(id, p.round).length != 0 && !court.tradesFreely()
+        ) {
+            // A verdict in progress is owed: the seller cannot dodge it by withdrawing.
+            vm.prank(who);
+            vm.expectRevert(PleaCourt.VotesCast.selector);
+            court.withdrawPlea(id);
         } else if (p.status == IPleaCourt.Status.Pending || p.status == IPleaCourt.Status.Denied) {
             vm.prank(who);
             court.withdrawPlea(id);
@@ -143,12 +161,23 @@ contract CourtHandler is Test {
     }
 
     function authorize(uint256 seed, uint128 amountSeed) public {
+        authorizePartial(seed, amountSeed, type(uint128).max);
+    }
+
+    /// @dev The pool may consume less than the reservation: only `consumed` is charged and recorded.
+    function authorizePartial(uint256 seed, uint128 amountSeed, uint128 consumedSeed) public {
         address who = actor(seed);
         (uint64 expiry, uint256 remaining) = court.saleWindow(who);
         if (expiry == 0 || remaining == 0 || court.tradesFreely()) return;
         uint256 amount = bound(amountSeed, 1, remaining);
-        uint256 id = driver.authorize(who, amount);
-        assertEq(court.sale(id).amount, amount);
+        uint256 consumed = bound(consumedSeed, 1, amount);
+        uint256 pleaId = court.activePlea(who);
+        uint256 soldBefore = court.plea(pleaId).sold;
+        uint256 id = driver.authorizePartial(who, amount, consumed);
+        assertEq(court.sale(id).amount, consumed);
+        IPleaCourt.Plea memory p = court.plea(pleaId);
+        assertEq(p.sold, soldBefore + consumed, "unconsumed reservation not returned to the window");
+        assertEq(p.status == IPleaCourt.Status.Closed, p.sold == p.amount);
         successfulSales++;
     }
 
@@ -158,6 +187,12 @@ contract CourtHandler is Test {
         IPleaCourt.Sale memory s = court.sale(saleId);
         address who = actor(actorSeed);
         if (s.objected || block.timestamp > s.executedAt + 20 minutes || imd.balanceOf(who) < 1 ether) return;
+        if (who == s.seller) {
+            vm.prank(who);
+            vm.expectRevert(PleaCourt.SelfObjection.selector);
+            court.object(saleId);
+            return;
+        }
         vm.startPrank(who);
         imd.approve(address(court), 1 ether);
         court.object(saleId);
@@ -172,6 +207,12 @@ contract CourtHandler is Test {
         uint256 id = 1 + seed % court.objectionCount();
         IPleaCourt.Objection memory beforeO = court.objection(id);
         if (beforeO.resolved) return;
+        if (block.timestamp > beforeO.openedAt + 48 hours) {
+            vm.prank(panel[0]);
+            vm.expectRevert(PleaCourt.RulingPeriodOver.selector);
+            court.ruleObjection(id, uphold);
+            return;
+        }
         for (uint256 j; j < 17; ++j) {
             vm.prank(panel[j]);
             court.ruleObjection(id, uphold);
@@ -179,7 +220,18 @@ contract CourtHandler is Test {
         reservedBonds -= 1 ether;
         if (uphold) {
             credits[beforeO.objector] += 1 ether;
-            points[court.sale(beforeO.saleId).seller] = 0;
+            IPleaCourt.Sale memory s = court.sale(beforeO.saleId);
+            if (s.season == court.season()) {
+                points[s.seller] = 0;
+            } else {
+                // The sale's season already paid out: its prize is forfeited back into the pot.
+                uint256 forfeited = prizeCredits[s.season][s.seller];
+                prizeCredits[s.season][s.seller] = 0;
+                prizesOutstanding -= forfeited;
+                pot += forfeited;
+            }
+            assertEq(court.activePlea(s.seller), 0, "upheld objection left a plea in flight");
+            assertGt(court.bannedUntil(s.seller), block.timestamp);
         } else {
             pot += 1 ether;
         }
@@ -208,7 +260,10 @@ contract CourtHandler is Test {
     }
 
     function claim(uint256 seed) public {
-        address who = actor(seed);
+        claimFor(actor(seed));
+    }
+
+    function claimFor(address who) public {
         uint256 due = credits[who];
         uint256 beforeBalance = imd.balanceOf(who);
         vm.prank(who);
@@ -224,8 +279,38 @@ contract CourtHandler is Test {
         }
     }
 
+    function claimPrize(uint256 seed, uint256 seasonSeed) public {
+        uint256 ended = court.season() - 1;
+        if (ended == 0) return;
+        claimPrizeFor(actor(seed), 1 + seasonSeed % ended);
+    }
+
+    function claimPrizeFor(address who, uint256 season_) public {
+        uint64 unlockAt = court.prizeUnlockAt(season_);
+        uint256 due = prizeCredits[season_][who];
+        assertEq(court.prizeCredit(season_, who), due, "prize credit mismatch");
+        uint256 beforeBalance = imd.balanceOf(who);
+        vm.prank(who);
+        if (block.timestamp < unlockAt) {
+            vm.expectRevert(abi.encodeWithSelector(PleaCourt.PrizeLocked.selector, unlockAt));
+            court.claimPrize(season_);
+        } else if (due == 0) {
+            vm.expectRevert(PleaCourt.NothingToClaim.selector);
+            court.claimPrize(season_);
+        } else {
+            court.claimPrize(season_);
+            assertEq(imd.balanceOf(who) - beforeBalance, due);
+            prizeCredits[season_][who] = 0;
+            prizesOutstanding -= due;
+            payouts += due;
+            successfulPrizeClaims++;
+        }
+    }
+
     function endSeason() public {
         if (block.timestamp < court.seasonStart() + 30 days) return;
+        uint256 ended = court.season();
+        bool sweep = court.deadManTriggered();
         uint256 totalPoints;
         for (uint256 i; i < actors.length; ++i) {
             totalPoints += points[actors[i]];
@@ -234,12 +319,19 @@ contract CourtHandler is Test {
         if (totalPoints > 0) {
             for (uint256 i; i < actors.length; ++i) {
                 uint256 share = pot * points[actors[i]] / totalPoints;
-                credits[actors[i]] += share;
+                prizeCredits[ended][actors[i]] += share;
+                prizesOutstanding += share;
                 distributed += share;
             }
         }
         court.endSeason();
         pot -= distributed;
+        if (sweep && pot > 0) {
+            // After the switch nobody can earn points again: the rest goes to the hook's owner.
+            credits[admin] += pot;
+            sweptToOwner += pot;
+            pot = 0;
+        }
         for (uint256 i; i < actors.length; ++i) {
             points[actors[i]] = 0;
         }

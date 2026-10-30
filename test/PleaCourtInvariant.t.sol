@@ -32,7 +32,7 @@ contract PleaCourtInvariantTest is CourtFixture {
         handler.rule(1, true);
         handler.claim(2);
 
-        bytes4[] memory selectors = new bytes4[](15);
+        bytes4[] memory selectors = new bytes4[](17);
         selectors[0] = handler.submit.selector;
         selectors[1] = handler.judgeOne.selector;
         selectors[2] = handler.completeVerdict.selector;
@@ -48,6 +48,8 @@ contract PleaCourtInvariantTest is CourtFixture {
         selectors[12] = handler.advanceTime.selector;
         selectors[13] = handler.setSeat.selector;
         selectors[14] = handler.completeVerdict.selector;
+        selectors[15] = handler.authorizePartial.selector;
+        selectors[16] = handler.claimPrize.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
@@ -57,11 +59,16 @@ contract PleaCourtInvariantTest is CourtFixture {
     }
 
     function checkAccounting() internal view {
-        uint256 credits;
+        uint256 credits = court.claimable(owner);
+        assertEq(credits, handler.credits(owner), "owner sweep mismatch");
         for (uint256 i; i < actors.length; ++i) {
             assertEq(court.claimable(actors[i]), handler.credits(actors[i]), "individual liability mismatch");
             credits += court.claimable(actors[i]);
+            for (uint256 s = 1; s < court.season(); ++s) {
+                assertEq(court.prizeCredit(s, actors[i]), handler.prizeCredits(s, actors[i]), "prize mismatch");
+            }
         }
+        credits += handler.prizesOutstanding();
         assertEq(court.totalClaimable(), credits);
         assertEq(court.bondsHeld(), handler.reservedBonds());
         assertEq(court.prizePot(), handler.pot(), "prizes and bonds must never enter the available pot");
@@ -76,7 +83,7 @@ contract PleaCourtInvariantTest is CourtFixture {
             IPleaCourt.Plea memory p = court.plea(id);
             assertLe(p.sold, p.amount);
             assertTrue(p.round == 1 || p.round == 2);
-            assertEq(p.appealed, p.round == 2);
+            if (p.round == 2) assertTrue(p.appealed); // Round 1 may be a re-hearing, already appealed.
             assertLe(uint256(p.approveVotes) + p.denyVotes, 30);
             assertEq(uint256(p.approveVotes) + p.denyVotes, court.scores(id, p.round).length);
             if (p.status == IPleaCourt.Status.Pending) {
@@ -84,7 +91,15 @@ contract PleaCourtInvariantTest is CourtFixture {
                 assertLt(p.approveVotes, 17);
                 assertLt(p.denyVotes, 17);
             }
-            if (p.status == IPleaCourt.Status.Closed || p.status == IPleaCourt.Status.Withdrawn) {
+            if (p.status == IPleaCourt.Status.Denied) {
+                // 17 denials, or a hung Cabal: all 30 voted and neither side reached 17.
+                assertTrue(p.denyVotes >= 17 || uint256(p.approveVotes) + p.denyVotes == 30);
+                assertLt(p.approveVotes, 17);
+            }
+            if (
+                p.status == IPleaCourt.Status.Closed || p.status == IPleaCourt.Status.Withdrawn
+                    || p.status == IPleaCourt.Status.Struck
+            ) {
                 assertTrue(court.activePlea(p.seller) != id, "finished plea still owns seller's slot");
             } else {
                 assertEq(court.activePlea(p.seller), id);
@@ -135,9 +150,14 @@ contract PleaCourtInvariantTest is CourtFixture {
 
     function afterInvariant() public {
         // Every credited actor can actually withdraw; aggregate solvency alone is not sufficient.
+        vm.warp(block.timestamp + 3 days); // Every ended season's prizes are unlocked now.
         for (uint256 i; i < actors.length; ++i) {
             handler.claim(i);
+            for (uint256 s = 1; s < court.season(); ++s) {
+                handler.claimPrizeFor(actors[i], s);
+            }
         }
+        handler.claimFor(owner);
         assertEq(court.totalClaimable(), 0);
         checkAccounting();
         assertGt(handler.successfulVotes(), 0);
@@ -161,9 +181,14 @@ contract PleaCourtInvariantTest is CourtFixture {
         }
         handler.endSeason();
         assertEq(handler.completedSeasons(), 1);
+        assertGt(handler.prizesOutstanding(), 0);
+        handler.claimPrize(0, 0); // Still locked: expects PrizeLocked.
+        assertEq(handler.successfulPrizeClaims(), 0);
+        handler.advanceTime(3 days);
         checkAccounting();
         invariant_pendingCountsActivePleasAndVoteBoundsAgree();
         invariant_bondsResolveOnceAndBoardContainsEligibleActors();
         afterInvariant();
+        assertGt(handler.successfulPrizeClaims(), 0);
     }
 }

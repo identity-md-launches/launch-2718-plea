@@ -16,7 +16,7 @@ contract PleaCourtAdversarialTest is CourtFixture {
         assertEq(bytes(court.pleaText(id)), text);
         assertEq(court.plea(id).amount, type(uint128).max);
         vm.prank(bob);
-        vm.expectRevert(PleaCourt.ZeroAmount.selector);
+        vm.expectRevert(PleaCourt.AmountTooLarge.selector);
         court.submitPlea("overflow", uint256(type(uint128).max) + 1);
         assertEq(court.pleaCount(), 1);
         assertEq(court.pendingCount(), 1);
@@ -105,16 +105,20 @@ contract PleaCourtAdversarialTest is CourtFixture {
         assertEq(court.seasonPoints(1, bob), 0);
     }
 
-    function test_15To15SplitRemainsPendingUntilDeadManDeadline() public {
+    function test_15To14SplitRemainsPendingUntilDeadManDeadline() public {
         uint256 id = submit(alice, 1);
         vote(id, 0, 15, 45, 26);
-        vote(id, 15, 15, 45, 25);
+        vote(id, 15, 14, 45, 25);
         assertEq(uint8(court.pleaStatus(id)), uint8(IPleaCourt.Status.Pending));
         assertEq(court.pendingCount(), 1);
         uint64 deadline = court.deadManDeadline();
         vm.warp(deadline - 1);
         assertFalse(court.tradesFreely());
         vm.warp(deadline);
+        // The last judge is too late: the silence already freed trading, and the late vote is refused.
+        vm.prank(panel[29]);
+        vm.expectRevert(PleaCourt.FreeTrading.selector);
+        court.judge(id, 45, 25);
         vm.expectEmit(true, true, true, true, address(court));
         emit PleaCourt.DeadManSwitchTriggered(deadline, deadline);
         court.triggerDeadManSwitch();
@@ -125,6 +129,35 @@ contract PleaCourtAdversarialTest is CourtFixture {
         assertEq(court.pendingCount(), 0);
         assertTrue(court.deadManTriggered());
         assertTrue(court.tradesFreely());
+    }
+
+    function test_15To15SplitIsAHungDenialAppealableOnceAndStopsTheClock() public {
+        uint256 id = submit(alice, 1);
+        vote(id, 0, 15, 45, 26);
+        vote(id, 15, 14, 45, 25);
+        assertEq(uint8(court.pleaStatus(id)), uint8(IPleaCourt.Status.Pending));
+        vote(id, 29, 1, 45, 25); // 30th vote: neither side reached 17.
+        IPleaCourt.Plea memory p = court.plea(id);
+        assertEq(uint8(p.status), uint8(IPleaCourt.Status.Denied));
+        assertEq(p.approveVotes, 15);
+        assertEq(p.denyVotes, 15);
+        assertEq(court.pendingCount(), 0);
+        assertEq(court.deadManDeadline(), 0);
+        assertEq(court.seasonPoints(1, alice), 0);
+        (uint64 expiry,) = court.saleWindow(alice);
+        assertEq(expiry, 0);
+        vm.expectRevert(PleaCourt.NoApprovedPlea.selector);
+        driver.authorize(alice, 1);
+        // A hung denial is the first denial: one appeal after 4 hours, not a second.
+        vm.warp(p.decidedAt + 4 hours);
+        vm.prank(alice);
+        court.appeal(id);
+        vote(id, 0, 17, 0, 0);
+        vm.warp(block.timestamp + 4 hours);
+        vm.prank(alice);
+        vm.expectRevert(PleaCourt.AlreadyAppealed.selector);
+        court.appeal(id);
+        assertFalse(court.tradesFreely());
     }
 
     function test_partialVotesAndNewPleasCannotExtendSilenceDeadline() public {
@@ -282,9 +315,12 @@ contract PleaCourtAdversarialTest is CourtFixture {
         imd.transfer(address(court), pot);
         vm.warp(court.seasonStart() + 30 days);
         court.endSeason();
-        uint256 a = court.claimable(alice);
-        uint256 b = court.claimable(bob) - 1 ether;
-        uint256 c = court.claimable(outsider);
+        uint256 a = court.prizeCredit(1, alice);
+        uint256 b = court.prizeCredit(1, bob);
+        uint256 c = court.prizeCredit(1, outsider);
+        assertEq(court.claimable(bob), 1 ether); // The returned bond stays immediately claimable.
+        assertEq(court.claimable(alice), 0);
+        assertEq(court.claimable(outsider), 0);
         assertLe(a * 6, pot);
         assertGt((a + 1) * 6, pot);
         assertLe(b * 6, pot * 2);
@@ -296,5 +332,25 @@ contract PleaCourtAdversarialTest is CourtFixture {
         assertEq(court.totalClaimable(), a + b + c + 1 ether);
         assertEq(court.prizePot(), pot - a - b - c);
         assertEq(imd.balanceOf(address(court)), court.totalClaimable() + court.bondsHeld() + court.prizePot());
+
+        // Prizes stay locked for exactly PRIZE_LOCK, then pay once.
+        uint64 unlockAt = court.prizeUnlockAt(1);
+        assertEq(unlockAt, block.timestamp + 3 days);
+        vm.warp(unlockAt - 1);
+        vm.prank(outsider);
+        vm.expectRevert(abi.encodeWithSelector(PleaCourt.PrizeLocked.selector, unlockAt));
+        court.claimPrize(1);
+        vm.warp(unlockAt);
+        uint256 before = imd.balanceOf(outsider);
+        if (c > 0) {
+            vm.prank(outsider);
+            court.claimPrize(1);
+        }
+        assertEq(imd.balanceOf(outsider) - before, c);
+        vm.prank(outsider);
+        vm.expectRevert(PleaCourt.NothingToClaim.selector);
+        court.claimPrize(1);
+        assertEq(court.totalClaimable(), a + b + 1 ether);
+        assertEq(court.prizePot(), pot - a - b - c);
     }
 }

@@ -18,8 +18,20 @@ contract CourtHookDriver {
         court.bind(imd);
     }
 
-    function authorize(address seller, uint256 amount) external returns (uint256) {
-        return court.authorizeSale(seller, amount);
+    /// @dev A full fill, as the hook reports it: reserve, then settle the whole reservation in one call.
+    function authorize(address seller, uint256 amount) external returns (uint256 saleId) {
+        saleId = court.authorizeSale(seller, amount);
+        court.settleSale(saleId, amount);
+    }
+
+    /// @dev A partial fill: the pool consumed only `consumed` of the reserved `amount`.
+    function authorizePartial(address seller, uint256 amount, uint256 consumed) external returns (uint256 saleId) {
+        saleId = court.authorizeSale(seller, amount);
+        court.settleSale(saleId, consumed);
+    }
+
+    function settle(uint256 saleId, uint256 consumed) external {
+        court.settleSale(saleId, consumed);
     }
 
     function transferOwner(address next) external {
