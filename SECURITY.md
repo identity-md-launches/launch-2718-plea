@@ -27,10 +27,14 @@ reviewer before release. Each finding says what was tried, what the code does, a
   model. A single compromised key can only cast one vote per plea per round (`hasScored`), and one per
   objection (`hasRuled`). A judge cannot score their own plea, and neither the sale's seller nor the
   objector rules on an objection (`Recused`).
-- **Hung Cabal.** When all 30 have voted and neither side has 17 (any 14/16 to 16/14 split), the plea
-  is denied with the median of all 30 and the seller may appeal. Without this a split vote left the plea
-  pending forever, blocked every further vote, and let the dead-man switch fire on a Cabal that had
-  voted in full (`test_hungCabalDeniesAndStopsTheClock`, reviewer proof `Proof_dd7e9df2facb`).
+- **Hung Cabal.** When every eligible judge has voted and neither side has 17 (any 14/16 to 16/14 split),
+  the plea is denied with the median of those votes and the seller may appeal. Without this a split vote
+  left the plea pending forever, blocked every further vote, and let the dead-man switch fire on a Cabal
+  that had voted in full (`test_hungCabalDeniesAndStopsTheClock`, reviewer proof `Proof_dd7e9df2facb`).
+  The eligible count is 30, or 29 when the seller is a judge (recused from their own plea): revision 2
+  settled only at 30, so a judge's own plea could hang on a 29-vote split and trip the switch
+  (`test_judgeSellerPleaSettlesWhenAllEligibleJudgesVoted`, finding `d38c1c69`). `setJudges` mid-round
+  can still change who is eligible; the owner's rescue for a round it has broken is another `setJudges`.
 - **Fact points are per judge.** A judge who credits 71 fact points approves any score; this is the
   judge's own vote and counts once. Sellers cannot self-declare facts.
 - **Seat multiplier.** Owner-granted; it scales only the judge's score of that seller, capped at 54,
@@ -62,7 +66,9 @@ reviewer before release. Each finding says what was tried, what the code does, a
   that could move it (`judge`, `appeal`, `withdrawPlea`, `authorizeSale`, `ruleObjection`, `_submit`)
   first latches `deadManTriggered` when due, so a late verdict or the withdrawal of the last pending
   plea cannot un-free trading (`test_deadManIsPermanentEvenIfTheCabalWakesUp`,
-  `test_noTimerWithoutPendingPlea`). `beforeSwap` reads `tradesFreely()` as a view, which is consistent
+  `test_noTimerWithoutPendingPlea`). `endSeason` latches too, since it reads the flag to choose between
+  rolling the pot and sweeping it to the owner (`test_endSeasonLatchesADueDeadManSwitchAndSweeps`,
+  finding `5ab39671`). `beforeSwap` reads `tradesFreely()` as a view, which is consistent
   with the latch.
 - **Clock before the Cabal.** No plea can be submitted until `setJudges` has run
   (`CabalNotConfigured`), so a stranger cannot start the 33-hour clock on a panel that does not exist
@@ -142,6 +148,15 @@ Of the low findings, partial fills, self-objection and reclaim precedence, the l
 documentation, letterbox nonce cancellation, recusal and the error name are fixed; "points without a
 sale" is kept by design (the reviewer's own proof asserts points at approval) and documented in the
 README's limitations.
+
+## 7. Independent review (revision 3)
+
+Two findings against revision 2, both reproduced and fixed: a judge's own plea could hang at 29 votes
+(the hung-Cabal rule now counts eligible judges, `eligibleJudges`), and `endSeason` did not latch a due
+dead-man switch before deciding whether to sweep the pot. The reviewer's proof for the first still
+fails after the fix because it also asserts the hung state itself (a re-vote reverting `AlreadyVoted`
+and withdrawal reverting `VotesCast`), which cannot hold once the verdict lands and the plea is Denied;
+the dispute is recorded in `.imd-responses.json`.
 
 ## 7. Open items before release
 

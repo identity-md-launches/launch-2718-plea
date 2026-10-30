@@ -372,6 +372,61 @@ contract PleaCourtRulesTest is PleaBase {
         court.judge(id, 45, 71);
     }
 
+    /// @dev A judge's own plea can collect at most 29 votes, so the hung-Cabal rule must settle it at 29:
+    /// otherwise a split leaves it pending forever and trips the dead-man switch.
+    function test_judgeSellerPleaSettlesWhenAllEligibleJudgesVoted() public {
+        address judgeSeller = judges[0];
+        vm.prank(judgeSeller);
+        uint256 id = court.submitPlea("a judge's own plea", 1e18);
+        assertEq(court.eligibleJudges(id), 29);
+        for (uint256 i = 1; i < 16; i++) {
+            vm.prank(judges[i]);
+            court.judge(id, 45, 26); // 15 approve
+        }
+        for (uint256 i = 16; i < 29; i++) {
+            vm.prank(judges[i]);
+            court.judge(id, 44, 26); // 13 deny
+        }
+        assertEq(uint8(court.pleaStatus(id)), uint8(IPleaCourt.Status.Pending));
+        // the 29th and last eligible vote settles the plea: sorted 14 x 44 then 15 x 45, median (15th) is 45
+        vm.expectEmit(true, true, true, true);
+        emit PleaCourt.Verdict(id, judgeSeller, 1, false, 45, 15, 14);
+        vm.prank(judges[29]);
+        court.judge(id, 44, 26);
+        assertEq(uint8(court.pleaStatus(id)), uint8(IPleaCourt.Status.Denied));
+        assertEq(court.pendingCount(), 0);
+        assertEq(court.deadManDeadline(), 0);
+        vm.warp(block.timestamp + 33 hours);
+        assertFalse(court.tradesFreely(), "every eligible judge voted: the gate stands");
+        // the denied plea is the seller's to appeal or withdraw like any other denial
+        vm.prank(judgeSeller);
+        court.appeal(id);
+        assertEq(court.plea(id).round, 2);
+        // round 2 settles at 29 votes too, here with 17 approvals before that
+        for (uint256 i = 1; i < 18; i++) {
+            vm.prank(judges[i]);
+            court.judge(id, 45, 26);
+        }
+        assertEq(uint8(court.pleaStatus(id)), uint8(IPleaCourt.Status.Approved));
+    }
+
+    function test_eligibleJudgesIsTheWholeCabalForOutsiders() public {
+        vm.prank(seller);
+        uint256 id = court.submitPlea("x", 1e18);
+        assertEq(court.eligibleJudges(id), 30);
+        // 15 approve, 14 deny: an outsider's plea still waits for the 30th vote
+        score(id, 15, 45, 26);
+        for (uint256 i = 15; i < 29; i++) {
+            vm.prank(judges[i]);
+            court.judge(id, 44, 26);
+        }
+        assertEq(uint8(court.pleaStatus(id)), uint8(IPleaCourt.Status.Pending));
+        vm.prank(judges[29]);
+        court.judge(id, 45, 26);
+        assertEq(uint8(court.pleaStatus(id)), uint8(IPleaCourt.Status.Denied));
+        assertEq(court.plea(id).approveVotes, 16);
+    }
+
     function test_sellerAndObjectorCannotRuleOnTheObjection() public {
         address judgeSeller = judges[0];
         factory.send(IERC20(address(token)), judgeSeller, 1e18);
@@ -469,6 +524,25 @@ contract PleaCourtRulesTest is PleaBase {
         court.endSeason();
         assertEq(court.claimable(owner), 0);
         assertEq(court.prizePot(), 1e18);
+    }
+
+    /// @dev A due but unlatched switch is latched by `endSeason` itself, so the pot is swept, not rolled.
+    function test_endSeasonLatchesADueDeadManSwitchAndSweeps() public {
+        vm.prank(seller);
+        court.submitPlea("x", 1e18); // nobody votes
+        imd.transfer(address(court), 5e18);
+        vm.warp(block.timestamp + 30 days);
+        assertTrue(court.tradesFreely());
+        assertFalse(court.deadManTriggered());
+        vm.expectEmit(false, false, false, false);
+        emit PleaCourt.DeadManSwitchTriggered(0, 0);
+        vm.expectEmit(true, true, true, true);
+        emit PleaCourt.PotSwept(1, owner, 5e18);
+        court.endSeason();
+        assertTrue(court.deadManTriggered());
+        assertEq(court.claimable(owner), 5e18);
+        assertEq(court.prizePot(), 0);
+        assertEq(court.season(), 2);
     }
 
     // ---------------------------------------------------------------- partial fills

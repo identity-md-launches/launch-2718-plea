@@ -369,7 +369,13 @@ contract PleaCourt is IPleaCourt {
 
         if (p.approveVotes >= QUORUM) _decide(pleaId, p, true);
         else if (p.denyVotes >= QUORUM) _decide(pleaId, p, false);
-        else if (uint256(p.approveVotes) + p.denyVotes >= JUDGE_COUNT) _decide(pleaId, p, false); // hung Cabal
+        else if (uint256(p.approveVotes) + p.denyVotes >= eligibleJudges(pleaId)) _decide(pleaId, p, false); // hung
+    }
+
+    /// @notice Judges who may score `pleaId`: the whole Cabal, less the seller when the seller sits on it.
+    /// The hung-Cabal rule settles the plea once this many have voted, so a judge's own plea cannot hang.
+    function eligibleJudges(uint256 pleaId) public view returns (uint256) {
+        return isJudge[_pleas[pleaId].seller] ? JUDGE_COUNT - 1 : JUDGE_COUNT;
     }
 
     function _decide(uint256 pleaId, Plea storage p, bool approved) internal {
@@ -555,6 +561,8 @@ contract PleaCourt is IPleaCourt {
     function endSeason() external {
         uint64 endsAt = seasonStart + uint64(SEASON_LENGTH);
         if (block.timestamp < endsAt) revert SeasonNotOver(endsAt);
+        _latchDeadMan(); // a due switch sweeps this pot rather than rolling it over
+
         uint256 pot = prizePot();
         uint256 ended = season;
         Entry[] memory top = _sorted(TOP_N);

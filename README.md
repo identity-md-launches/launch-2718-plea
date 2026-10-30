@@ -81,9 +81,10 @@ liquidity or fee collect, or move anyone's tokens.
   credits, each lowering the bar by one from 71). Seat holders' scores are multiplied by 1.2. The judge's
   vote is an approval when `scaledScore + factPoints >= 71`. As soon as 17 judges share a side, the
   median of the Cabal's scores is settled whatever the other 13 say, so the verdict is final: `Verdict`
-  is emitted with the median of the scores given so far. When all 30 have voted and neither side has 17
-  (a hung Cabal), the plea is denied with that median: approval needs 17 to agree, and the seller may
-  appeal. A judge cannot score their own plea (`Recused`).
+  is emitted with the median of the scores given so far. When every eligible judge has voted and neither
+  side has 17 (a hung Cabal), the plea is denied with that median: approval needs 17 to agree, and the
+  seller may appeal. A judge cannot score their own plea (`Recused`), so a judge's own plea has 29
+  eligible judges and settles at 29 votes; `eligibleJudges(pleaId)` shows the count.
 - **Approved:** a 7-minute sale window for up to the plea's amount, through `hook.sell`. Selling it all
   or `closeWindow` after expiry closes the plea and frees the seller to plead again. The median score is
   added to the seller's season points, and the plea records the season they went to.
@@ -114,8 +115,8 @@ liquidity or fee collect, or move anyone's tokens.
 - **Dead-man switch.** While at least one plea is pending, a deadline runs 33 hours from the later of
   "a plea became pending with none before it" and "the last verdict". Past it, `tradesFreely()` is
   true: the hook lets every sell and every liquidity add through, and no state change can reverse it
-  (the first state-changing call latches `deadManTriggered` and emits `DeadManSwitchTriggered`;
-  `triggerDeadManSwitch()` does so on demand). Pleas, judging and appeals then refuse with `FreeTrading`.
+  (the first state-changing call, `endSeason` included, latches `deadManTriggered` and emits
+  `DeadManSwitchTriggered`; `triggerDeadManSwitch()` does so on demand). Pleas, judging and appeals then refuse with `FreeTrading`.
   No plea can be submitted before the Cabal is installed, so the clock cannot start on a panel that
   does not exist. After the switch nobody can earn points again: the next `endSeason` pays the board as
   usual, and whatever the board does not take, then and in every later season, is credited to the hook's
